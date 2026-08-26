@@ -293,6 +293,22 @@ int rf_blade_set_rx_gain(void* h, double gain)
 {
   int                 status;
   rf_blade_handler_t* handler = (rf_blade_handler_t*)h;
+
+  if (gain < 0) {
+    status = bladerf_set_gain_mode(handler->dev, BLADERF_RX_X1, BLADERF_GAIN_DEFAULT);
+    if (status != 0) {
+      ERROR("Failed to enable RX AGC: %s", bladerf_strerror(status));
+      return SRSRAN_ERROR;
+    }
+    return SRSRAN_SUCCESS;
+  }
+
+  status = bladerf_set_gain_mode(handler->dev, BLADERF_RX_X1, BLADERF_GAIN_MGC);
+  if (status != 0) {
+    ERROR("Failed to enable manual RX gain control: %s", bladerf_strerror(status));
+    return SRSRAN_ERROR;
+  }
+
   status                      = bladerf_set_gain(handler->dev, BLADERF_RX_X1, (bladerf_gain)gain);
   if (status != 0) {
     ERROR("Failed to set RX gain: %s", bladerf_strerror(status));
