@@ -153,9 +153,27 @@ int radio::init(const rf_args_t& args, phy_interface_radio* phy_)
     continuous_tx = (args.continuous_tx == "yes");
   }
 
-  // Set fixed gain options
+  // Set fixed gain options. A negative gain requests automatic gain control.
+  // bladeRF implements AGC in hardware, while the remaining RF backends keep
+  // using the existing software gain thread.
   if (args.rx_gain < 0) {
-    start_agc(false);
+    bool bladerf_hardware_agc = not rf_devices.empty();
+    for (srsran_rf_t& rf_device : rf_devices) {
+      bladerf_hardware_agc = bladerf_hardware_agc and std::string(srsran_rf_name(&rf_device)) == "bladerf";
+    }
+
+    if (bladerf_hardware_agc) {
+      for (srsran_rf_t& rf_device : rf_devices) {
+        if (srsran_rf_set_rx_gain(&rf_device, args.rx_gain) < 0) {
+          logger.error("Failed to enable bladeRF hardware RX AGC");
+          return SRSRAN_ERROR;
+        }
+      }
+      logger.info("Enabled bladeRF hardware RX AGC");
+    } else if (not start_agc(false)) {
+      logger.error("Failed to start RX AGC");
+      return SRSRAN_ERROR;
+    }
   } else {
     set_rx_gain(args.rx_gain);
   }
