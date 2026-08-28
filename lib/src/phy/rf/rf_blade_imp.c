@@ -20,6 +20,9 @@
  */
 
 #include <libbladeRF.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -40,6 +43,10 @@ typedef struct {
   int16_t             tx_buffer[CONVERT_BUFFER_SIZE];
   bool                rx_stream_enabled;
   bool                tx_stream_enabled;
+  bladerf_channel     rx_channel;
+  bladerf_channel     tx_channel;
+  uint32_t            rx_channel_number;
+  uint32_t            tx_channel_number;
   srsran_rf_info_t    info;
 } rf_blade_handler_t;
 
@@ -63,6 +70,109 @@ const unsigned int buffer_size_tx    = 1024;
 const unsigned int num_transfers     = 32;
 const unsigned int timeout_ms        = 4000;
 
+static char* trim_whitespace(char* value)
+{
+  while (*value == ' ' || *value == '\t') {
+    value++;
+  }
+
+  char* end = value + strlen(value);
+  while (end > value && (end[-1] == ' ' || end[-1] == '\t')) {
+    end--;
+  }
+  *end = '\0';
+
+  return value;
+}
+
+static int parse_channel_number(const char* value, const char* option, uint32_t* channel_number)
+{
+  char* end    = NULL;
+  long  parsed = 0;
+
+  errno  = 0;
+  parsed = strtol(value, &end, 10);
+
+  while (end != NULL && (*end == ' ' || *end == '\t')) {
+    end++;
+  }
+
+  if (errno != 0 || end == value || end == NULL || *end != '\0' || parsed < 1 || parsed > 2) {
+    ERROR("Invalid bladeRF %s=%s. Expected physical channel 1 or 2.", option, value);
+    return SRSRAN_ERROR;
+  }
+
+  *channel_number = (uint32_t)parsed;
+  return SRSRAN_SUCCESS;
+}
+
+static int append_device_identifier(char device_identifier[RF_PARAM_LEN], const char* value)
+{
+  size_t current_len = strlen(device_identifier);
+  size_t value_len   = strlen(value);
+  size_t separator   = current_len == 0 ? 0 : 1;
+
+  if (current_len + separator + value_len >= RF_PARAM_LEN) {
+    ERROR("bladeRF device identifier is too long.");
+    return SRSRAN_ERROR;
+  }
+
+  if (separator != 0) {
+    device_identifier[current_len++] = ',';
+  }
+  memcpy(device_identifier + current_len, value, value_len + 1);
+
+  return SRSRAN_SUCCESS;
+}
+
+static int parse_blade_args(const char* args,
+                            uint32_t*   tx_channel_number,
+                            uint32_t*   rx_channel_number,
+                            char        device_identifier[RF_PARAM_LEN])
+{
+  *tx_channel_number   = 1;
+  *rx_channel_number   = 1;
+  device_identifier[0] = '\0';
+
+  if (args == NULL || args[0] == '\0' || strcmp(args, "auto") == 0) {
+    return SRSRAN_SUCCESS;
+  }
+
+  if (strlen(args) >= RF_PARAM_LEN) {
+    ERROR("bladeRF device arguments are too long.");
+    return SRSRAN_ERROR;
+  }
+
+  char args_copy[RF_PARAM_LEN] = {0};
+  memcpy(args_copy, args, strlen(args) + 1);
+
+  char* saveptr = NULL;
+  char* token   = strtok_r(args_copy, ",", &saveptr);
+  while (token != NULL) {
+    char* option = trim_whitespace(token);
+
+    if (strncmp(option, "tx_channel=", strlen("tx_channel=")) == 0) {
+      if (parse_channel_number(option + strlen("tx_channel="), "tx_channel", tx_channel_number) !=
+          SRSRAN_SUCCESS) {
+        return SRSRAN_ERROR;
+      }
+    } else if (strncmp(option, "rx_channel=", strlen("rx_channel=")) == 0) {
+      if (parse_channel_number(option + strlen("rx_channel="), "rx_channel", rx_channel_number) !=
+          SRSRAN_SUCCESS) {
+        return SRSRAN_ERROR;
+      }
+    } else if (option[0] != '\0' && strcmp(option, "auto") != 0) {
+      if (append_device_identifier(device_identifier, option) != SRSRAN_SUCCESS) {
+        return SRSRAN_ERROR;
+      }
+    }
+
+    token = strtok_r(NULL, ",", &saveptr);
+  }
+
+  return SRSRAN_SUCCESS;
+}
+
 const char* rf_blade_devname(UNUSED void* h)
 {
   return DEVNAME;
@@ -84,7 +194,7 @@ int rf_blade_start_tx_stream(void* h)
     ERROR("Failed to configure TX sync interface: %s", bladerf_strerror(status));
     return status;
   }
-  status = bladerf_enable_module(handler->dev, BLADERF_TX_X1, true);
+  status = bladerf_enable_module(handler->dev, handler->tx_channel, true);
   if (status != 0) {
     ERROR("Failed to enable TX module: %s", bladerf_strerror(status));
     return status;
@@ -124,12 +234,12 @@ int rf_blade_start_rx_stream(void* h, UNUSED bool now)
     ERROR("Failed to configure TX sync interface: %s", bladerf_strerror(status));
     return status;
   }
-  status = bladerf_enable_module(handler->dev, BLADERF_RX_X1, true);
+  status = bladerf_enable_module(handler->dev, handler->rx_channel, true);
   if (status != 0) {
     ERROR("Failed to enable RX module: %s", bladerf_strerror(status));
     return status;
   }
-  status = bladerf_enable_module(handler->dev, BLADERF_TX_X1, true);
+  status = bladerf_enable_module(handler->dev, handler->tx_channel, true);
   if (status != 0) {
     ERROR("Failed to enable TX module: %s", bladerf_strerror(status));
     return status;
@@ -141,12 +251,12 @@ int rf_blade_start_rx_stream(void* h, UNUSED bool now)
 int rf_blade_stop_rx_stream(void* h)
 {
   rf_blade_handler_t* handler = (rf_blade_handler_t*)h;
-  int                 status  = bladerf_enable_module(handler->dev, BLADERF_RX_X1, false);
+  int                 status  = bladerf_enable_module(handler->dev, handler->rx_channel, false);
   if (status != 0) {
     ERROR("Failed to enable RX module: %s", bladerf_strerror(status));
     return status;
   }
-  status = bladerf_enable_module(handler->dev, BLADERF_TX_X1, false);
+  status = bladerf_enable_module(handler->dev, handler->tx_channel, false);
   if (status != 0) {
     ERROR("Failed to enable TX module: %s", bladerf_strerror(status));
     return status;
@@ -177,7 +287,14 @@ int rf_blade_open(char* args, void** h)
 {
   const struct bladerf_range* range_tx = NULL;
   const struct bladerf_range* range_rx = NULL;
-  *h                                   = NULL;
+  char                        device_identifier[RF_PARAM_LEN] = {0};
+  uint32_t                    tx_channel_number               = 1;
+  uint32_t                    rx_channel_number               = 1;
+  *h = NULL;
+
+  if (parse_blade_args(args, &tx_channel_number, &rx_channel_number, device_identifier) != SRSRAN_SUCCESS) {
+    return SRSRAN_ERROR;
+  }
 
   rf_blade_handler_t* handler = (rf_blade_handler_t*)malloc(sizeof(rf_blade_handler_t));
   if (!handler) {
@@ -186,35 +303,51 @@ int rf_blade_open(char* args, void** h)
   }
   *h = handler;
 
-  printf("Opening bladeRF...\n");
-  int status = bladerf_open(&handler->dev, args);
+  handler->dev               = NULL;
+  handler->tx_channel_number = tx_channel_number;
+  handler->rx_channel_number = rx_channel_number;
+  handler->tx_channel        = BLADERF_CHANNEL_TX(tx_channel_number - 1);
+  handler->rx_channel        = BLADERF_CHANNEL_RX(rx_channel_number - 1);
+
+  printf("Opening bladeRF with TX%u/RX%u...\n", handler->tx_channel_number, handler->rx_channel_number);
+  const char* identifier = device_identifier[0] == '\0' ? NULL : device_identifier;
+  int         status     = bladerf_open(&handler->dev, identifier);
   if (status) {
     ERROR("Unable to open device: %s", bladerf_strerror(status));
     goto clean_exit;
   }
 
-  status = bladerf_set_gain_mode(handler->dev, BLADERF_RX_X1, BLADERF_GAIN_MGC);
+  if (handler->tx_channel_number > bladerf_get_channel_count(handler->dev, BLADERF_TX) ||
+      handler->rx_channel_number > bladerf_get_channel_count(handler->dev, BLADERF_RX)) {
+    ERROR("Selected TX%u/RX%u is unavailable on this bladeRF.",
+          handler->tx_channel_number,
+          handler->rx_channel_number);
+    status = SRSRAN_ERROR;
+    goto clean_exit;
+  }
+
+  status = bladerf_set_gain_mode(handler->dev, handler->rx_channel, BLADERF_GAIN_MGC);
   if (status) {
-    ERROR("Unable to open device: %s", bladerf_strerror(status));
+    ERROR("Failed to set RX gain mode: %s", bladerf_strerror(status));
     goto clean_exit;
   }
 
   // bladerf_log_set_verbosity(BLADERF_LOG_LEVEL_VERBOSE);
 
   /* Get Gain ranges and set Rx to maximum */
-  status = bladerf_get_gain_range(handler->dev, BLADERF_RX_X1, &range_rx);
+  status = bladerf_get_gain_range(handler->dev, handler->rx_channel, &range_rx);
   if ((status != 0) || (range_rx == NULL)) {
     ERROR("Failed to get RX gain range: %s", bladerf_strerror(status));
     goto clean_exit;
   }
 
-  status = bladerf_get_gain_range(handler->dev, BLADERF_TX_X1, &range_tx);
+  status = bladerf_get_gain_range(handler->dev, handler->tx_channel, &range_tx);
   if ((status != 0) || (range_tx == NULL)) {
     ERROR("Failed to get TX gain range: %s", bladerf_strerror(status));
     goto clean_exit;
   }
 
-  status = bladerf_set_gain(handler->dev, BLADERF_RX_X1, (bladerf_gain)range_rx->max);
+  status = bladerf_set_gain(handler->dev, handler->rx_channel, (bladerf_gain)range_rx->max);
   if (status != 0) {
     ERROR("Failed to set RX LNA gain: %s", bladerf_strerror(status));
     goto clean_exit;
@@ -235,7 +368,11 @@ int rf_blade_open(char* args, void** h)
   return SRSRAN_SUCCESS;
 
 clean_exit:
+  if (handler->dev != NULL) {
+    bladerf_close(handler->dev);
+  }
   free(handler);
+  *h = NULL;
   return status;
 }
 
@@ -250,19 +387,21 @@ double rf_blade_set_rx_srate(void* h, double freq)
 {
   uint32_t            bw;
   rf_blade_handler_t* handler = (rf_blade_handler_t*)h;
-  int                 status  = bladerf_set_sample_rate(handler->dev, BLADERF_RX_X1, (uint32_t)freq, &handler->rx_rate);
+  int                 status  =
+      bladerf_set_sample_rate(handler->dev, handler->rx_channel, (uint32_t)freq, &handler->rx_rate);
   if (status != 0) {
     ERROR("Failed to set samplerate = %u: %s", (uint32_t)freq, bladerf_strerror(status));
     return -1;
   }
   if (handler->rx_rate < 2000000) {
-    status = bladerf_set_bandwidth(handler->dev, BLADERF_RX_X1, handler->rx_rate, &bw);
+    status = bladerf_set_bandwidth(handler->dev, handler->rx_channel, handler->rx_rate, &bw);
     if (status != 0) {
       ERROR("Failed to set bandwidth = %u: %s", handler->rx_rate, bladerf_strerror(status));
       return -1;
     }
   } else {
-    status = bladerf_set_bandwidth(handler->dev, BLADERF_RX_X1, (bladerf_bandwidth)(handler->rx_rate * 0.8), &bw);
+    status =
+        bladerf_set_bandwidth(handler->dev, handler->rx_channel, (bladerf_bandwidth)(handler->rx_rate * 0.8), &bw);
     if (status != 0) {
       ERROR("Failed to set bandwidth = %u: %s", handler->rx_rate, bladerf_strerror(status));
       return -1;
@@ -276,12 +415,13 @@ double rf_blade_set_tx_srate(void* h, double freq)
 {
   uint32_t            bw;
   rf_blade_handler_t* handler = (rf_blade_handler_t*)h;
-  int                 status  = bladerf_set_sample_rate(handler->dev, BLADERF_TX_X1, (uint32_t)freq, &handler->tx_rate);
+  int                 status  =
+      bladerf_set_sample_rate(handler->dev, handler->tx_channel, (uint32_t)freq, &handler->tx_rate);
   if (status != 0) {
     ERROR("Failed to set samplerate = %u: %s", (uint32_t)freq, bladerf_strerror(status));
     return -1;
   }
-  status = bladerf_set_bandwidth(handler->dev, BLADERF_TX_X1, handler->tx_rate, &bw);
+  status = bladerf_set_bandwidth(handler->dev, handler->tx_channel, handler->tx_rate, &bw);
   if (status != 0) {
     ERROR("Failed to set bandwidth = %u: %s", handler->tx_rate, bladerf_strerror(status));
     return -1;
@@ -295,7 +435,7 @@ int rf_blade_set_rx_gain(void* h, double gain)
   rf_blade_handler_t* handler = (rf_blade_handler_t*)h;
 
   if (gain < 0) {
-    status = bladerf_set_gain_mode(handler->dev, BLADERF_RX_X1, BLADERF_GAIN_DEFAULT);
+    status = bladerf_set_gain_mode(handler->dev, handler->rx_channel, BLADERF_GAIN_DEFAULT);
     if (status != 0) {
       ERROR("Failed to enable RX AGC: %s", bladerf_strerror(status));
       return SRSRAN_ERROR;
@@ -303,13 +443,13 @@ int rf_blade_set_rx_gain(void* h, double gain)
     return SRSRAN_SUCCESS;
   }
 
-  status = bladerf_set_gain_mode(handler->dev, BLADERF_RX_X1, BLADERF_GAIN_MGC);
+  status = bladerf_set_gain_mode(handler->dev, handler->rx_channel, BLADERF_GAIN_MGC);
   if (status != 0) {
     ERROR("Failed to enable manual RX gain control: %s", bladerf_strerror(status));
     return SRSRAN_ERROR;
   }
 
-  status                      = bladerf_set_gain(handler->dev, BLADERF_RX_X1, (bladerf_gain)gain);
+  status                      = bladerf_set_gain(handler->dev, handler->rx_channel, (bladerf_gain)gain);
   if (status != 0) {
     ERROR("Failed to set RX gain: %s", bladerf_strerror(status));
     return SRSRAN_ERROR;
@@ -317,7 +457,7 @@ int rf_blade_set_rx_gain(void* h, double gain)
   return SRSRAN_SUCCESS;
 }
 
-int rf_blade_set_rx_gain_ch(void* h, uint32_t ch, double gain)
+int rf_blade_set_rx_gain_ch(void* h, UNUSED uint32_t ch, double gain)
 {
   return rf_blade_set_rx_gain(h, gain);
 }
@@ -326,7 +466,7 @@ int rf_blade_set_tx_gain(void* h, double gain)
 {
   int                 status;
   rf_blade_handler_t* handler = (rf_blade_handler_t*)h;
-  status                      = bladerf_set_gain(handler->dev, BLADERF_TX_X1, (bladerf_gain)gain);
+  status                      = bladerf_set_gain(handler->dev, handler->tx_channel, (bladerf_gain)gain);
   if (status != 0) {
     ERROR("Failed to set TX gain: %s", bladerf_strerror(status));
     return SRSRAN_ERROR;
@@ -334,7 +474,7 @@ int rf_blade_set_tx_gain(void* h, double gain)
   return SRSRAN_SUCCESS;
 }
 
-int rf_blade_set_tx_gain_ch(void* h, uint32_t ch, double gain)
+int rf_blade_set_tx_gain_ch(void* h, UNUSED uint32_t ch, double gain)
 {
   return rf_blade_set_tx_gain(h, gain);
 }
@@ -344,7 +484,7 @@ double rf_blade_get_rx_gain(void* h)
   int                 status;
   bladerf_gain        gain    = 0;
   rf_blade_handler_t* handler = (rf_blade_handler_t*)h;
-  status                      = bladerf_get_gain(handler->dev, BLADERF_RX_X1, &gain);
+  status                      = bladerf_get_gain(handler->dev, handler->rx_channel, &gain);
   if (status != 0) {
     ERROR("Failed to get RX gain: %s", bladerf_strerror(status));
     return -1;
@@ -357,7 +497,7 @@ double rf_blade_get_tx_gain(void* h)
   int                 status;
   bladerf_gain        gain    = 0;
   rf_blade_handler_t* handler = (rf_blade_handler_t*)h;
-  status                      = bladerf_get_gain(handler->dev, BLADERF_TX_X1, &gain);
+  status                      = bladerf_get_gain(handler->dev, handler->tx_channel, &gain);
   if (status != 0) {
     ERROR("Failed to get TX gain: %s", bladerf_strerror(status));
     return -1;
@@ -381,14 +521,14 @@ double rf_blade_set_rx_freq(void* h, UNUSED uint32_t ch, double freq)
 {
   rf_blade_handler_t* handler = (rf_blade_handler_t*)h;
   bladerf_frequency   f_int   = (uint32_t)round(freq);
-  int                 status  = bladerf_set_frequency(handler->dev, BLADERF_RX_X1, f_int);
+  int                 status  = bladerf_set_frequency(handler->dev, handler->rx_channel, f_int);
   if (status != 0) {
     ERROR("Failed to set samplerate = %u: %s", (uint32_t)freq, bladerf_strerror(status));
     return -1;
   }
   f_int = 0;
-  bladerf_get_frequency(handler->dev, BLADERF_RX_X1, &f_int);
-  printf("set RX frequency to %lu\n", f_int);
+  bladerf_get_frequency(handler->dev, handler->rx_channel, &f_int);
+  printf("set RX frequency to %" PRIu64 "\n", (uint64_t)f_int);
 
   return freq;
 }
@@ -397,15 +537,15 @@ double rf_blade_set_tx_freq(void* h, UNUSED uint32_t ch, double freq)
 {
   rf_blade_handler_t* handler = (rf_blade_handler_t*)h;
   bladerf_frequency   f_int   = (uint32_t)round(freq);
-  int                 status  = bladerf_set_frequency(handler->dev, BLADERF_TX_X1, f_int);
+  int                 status  = bladerf_set_frequency(handler->dev, handler->tx_channel, f_int);
   if (status != 0) {
     ERROR("Failed to set samplerate = %u: %s", (uint32_t)freq, bladerf_strerror(status));
     return -1;
   }
 
   f_int = 0;
-  bladerf_get_frequency(handler->dev, BLADERF_TX_X1, &f_int);
-  printf("set TX frequency to %lu\n", f_int);
+  bladerf_get_frequency(handler->dev, handler->tx_channel, &f_int);
+  printf("set TX frequency to %" PRIu64 "\n", (uint64_t)f_int);
   return freq;
 }
 
