@@ -69,6 +69,10 @@ rx_gain = 40
 
 #device_name = auto
 
+# bladeRF 2.0 Micro physical RF port selection (defaults to TX1/RX1):
+#device_name = bladeRF
+#device_args = tx_channel=1,rx_channel=2
+
 # For best performance in 2x2 MIMO and >= 15 MHz use the following device_args settings:
 #     USRP B210: num_recv_frames=64,num_send_frames=64
 #     And for 75 PRBs, also append ",master_clock_rate=15.36e6" to the device args
