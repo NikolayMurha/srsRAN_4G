@@ -356,6 +356,36 @@ int rf_blade_open(char* args, void** h)
     goto clean_exit;
   }
 
+  bladerf_power_sources power_source;
+  float                 bus_voltage = 0.0f;
+  float                 load_current = 0.0f;
+  float                 load_power   = 0.0f;
+  int                   source_status;
+  int                   voltage_status;
+  int                   current_status;
+  int                   power_status;
+
+  source_status  = bladerf_get_power_source(handler->dev, &power_source);
+  voltage_status = bladerf_get_pmic_register(handler->dev, BLADERF_PMIC_VOLTAGE_BUS, &bus_voltage);
+  current_status = bladerf_get_pmic_register(handler->dev, BLADERF_PMIC_CURRENT, &load_current);
+  power_status   = bladerf_get_pmic_register(handler->dev, BLADERF_PMIC_POWER, &load_power);
+  if (source_status == 0 && voltage_status == 0 && current_status == 0 && power_status == 0) {
+    const char* source_name = power_source == BLADERF_PS_DC       ? "DC"
+                              : power_source == BLADERF_PS_USB_VBUS ? "USB"
+                                                                    : "unknown";
+    printf("bladeRF power: source=%s bus=%.3f V current=%.3f A power=%.3f W\n",
+           source_name,
+           bus_voltage,
+           load_current,
+           load_power);
+  } else {
+    printf("bladeRF power telemetry unavailable: source=%s voltage=%s current=%s power=%s\n",
+           bladerf_strerror(source_status),
+           bladerf_strerror(voltage_status),
+           bladerf_strerror(current_status),
+           bladerf_strerror(power_status));
+  }
+
   if (handler->tx_channel_number > bladerf_get_channel_count(handler->dev, BLADERF_TX) ||
       handler->rx_channel_number > bladerf_get_channel_count(handler->dev, BLADERF_RX)) {
     ERROR("Selected TX%u/RX%u is unavailable on this bladeRF.",
@@ -466,6 +496,7 @@ double rf_blade_set_tx_srate(void* h, double freq)
     ERROR("Failed to set bandwidth = %u: %s", handler->tx_rate, bladerf_strerror(status));
     return -1;
   }
+  printf("Set TX sampling rate %.2f Mhz, filter BW: %.2f Mhz\n", (float)handler->tx_rate / 1e6, (float)bw / 1e6);
   return (double)handler->tx_rate;
 }
 
