@@ -37,6 +37,8 @@
 #define CONVERT_BUFFER_SIZE (240 * 1024)
 #define BLADERF_RX_FULL_SCALE 2048.0
 #define BLADERF_RX_CLIP_LEVEL 2047
+#define BLADERF_TX_FULL_SCALE 2048.0
+#define BLADERF_TX_CLIP_LEVEL 2047
 
 typedef struct {
   struct bladerf*     dev;
@@ -53,6 +55,13 @@ typedef struct {
   bool                rx_monitor_enabled;
   uint64_t            rx_monitor_last_timestamp;
   uint64_t            rx_monitor_overruns;
+  bool                tx_monitor_enabled;
+  uint64_t            tx_monitor_sample_count;
+  uint64_t            tx_monitor_component_count;
+  uint64_t            tx_monitor_sum_squares;
+  uint64_t            tx_monitor_clipped;
+  uint64_t            tx_monitor_underruns;
+  uint32_t            tx_monitor_peak_abs;
   bladerf_gain        rx_gain_config;
   bladerf_gain_mode   rx_gain_mode;
   srsran_rf_info_t    info;
@@ -152,11 +161,13 @@ static int parse_blade_args(const char* args,
                             uint32_t*   tx_channel_number,
                             uint32_t*   rx_channel_number,
                             bool*       rx_monitor_enabled,
+                            bool*       tx_monitor_enabled,
                             char        device_identifier[RF_PARAM_LEN])
 {
   *tx_channel_number   = 1;
   *rx_channel_number   = 1;
   *rx_monitor_enabled  = false;
+  *tx_monitor_enabled  = false;
   device_identifier[0] = '\0';
 
   if (args == NULL || args[0] == '\0' || strcmp(args, "auto") == 0) {
@@ -188,6 +199,10 @@ static int parse_blade_args(const char* args,
       }
     } else if (strncmp(option, "rx_monitor=", strlen("rx_monitor=")) == 0) {
       if (parse_bool_option(option + strlen("rx_monitor="), "rx_monitor", rx_monitor_enabled) != SRSRAN_SUCCESS) {
+        return SRSRAN_ERROR;
+      }
+    } else if (strncmp(option, "tx_monitor=", strlen("tx_monitor=")) == 0) {
+      if (parse_bool_option(option + strlen("tx_monitor="), "tx_monitor", tx_monitor_enabled) != SRSRAN_SUCCESS) {
         return SRSRAN_ERROR;
       }
     } else if (option[0] != '\0' && strcmp(option, "auto") != 0) {
@@ -320,10 +335,15 @@ int rf_blade_open(char* args, void** h)
   uint32_t                    tx_channel_number               = 1;
   uint32_t                    rx_channel_number               = 1;
   bool                        rx_monitor_enabled               = false;
+  bool                        tx_monitor_enabled               = false;
   *h = NULL;
 
-  if (parse_blade_args(
-          args, &tx_channel_number, &rx_channel_number, &rx_monitor_enabled, device_identifier) != SRSRAN_SUCCESS) {
+  if (parse_blade_args(args,
+                       &tx_channel_number,
+                       &rx_channel_number,
+                       &rx_monitor_enabled,
+                       &tx_monitor_enabled,
+                       device_identifier) != SRSRAN_SUCCESS) {
     return SRSRAN_ERROR;
   }
 
@@ -342,13 +362,21 @@ int rf_blade_open(char* args, void** h)
   handler->rx_monitor_enabled        = rx_monitor_enabled;
   handler->rx_monitor_last_timestamp = 0;
   handler->rx_monitor_overruns       = 0;
+  handler->tx_monitor_enabled         = tx_monitor_enabled;
+  handler->tx_monitor_sample_count    = 0;
+  handler->tx_monitor_component_count = 0;
+  handler->tx_monitor_sum_squares     = 0;
+  handler->tx_monitor_clipped         = 0;
+  handler->tx_monitor_underruns       = 0;
+  handler->tx_monitor_peak_abs        = 0;
   handler->rx_gain_config            = 0;
   handler->rx_gain_mode              = BLADERF_GAIN_MGC;
 
-  printf("Opening bladeRF with TX%u/RX%u (RX monitor %s)...\n",
+  printf("Opening bladeRF with TX%u/RX%u (RX monitor %s, TX monitor %s)...\n",
          handler->tx_channel_number,
          handler->rx_channel_number,
-         handler->rx_monitor_enabled ? "enabled" : "disabled");
+         handler->rx_monitor_enabled ? "enabled" : "disabled",
+         handler->tx_monitor_enabled ? "enabled" : "disabled");
   const char* identifier = device_identifier[0] == '\0' ? NULL : device_identifier;
   int         status     = bladerf_open(&handler->dev, identifier);
   if (status) {
@@ -775,6 +803,52 @@ int rf_blade_send_timed_multi(void*  h,
       h, data[0], nsamples, secs, frac_secs, has_time_spec, blocking, is_start_of_burst, is_end_of_burst);
 }
 
+static void rf_blade_monitor_tx(rf_blade_handler_t* handler, int nsamples)
+{
+  if (!handler->tx_monitor_enabled || handler->tx_rate == 0 || nsamples <= 0) {
+    return;
+  }
+
+  const uint32_t component_count = 2U * (uint32_t)nsamples;
+  for (uint32_t i = 0; i != component_count; ++i) {
+    const int32_t  sample     = handler->tx_buffer[i];
+    const uint32_t sample_abs = sample < 0 ? (uint32_t)(-sample) : (uint32_t)sample;
+    handler->tx_monitor_peak_abs = sample_abs > handler->tx_monitor_peak_abs ? sample_abs
+                                                                              : handler->tx_monitor_peak_abs;
+    handler->tx_monitor_sum_squares += (uint64_t)((int64_t)sample * sample);
+    handler->tx_monitor_clipped += sample_abs >= BLADERF_TX_CLIP_LEVEL;
+  }
+  handler->tx_monitor_sample_count += (uint64_t)nsamples;
+  handler->tx_monitor_component_count += component_count;
+
+  if (handler->tx_monitor_sample_count < handler->tx_rate) {
+    return;
+  }
+
+  const double rms = sqrt((double)handler->tx_monitor_sum_squares / handler->tx_monitor_component_count);
+  const double peak_dbfs =
+      20.0 * log10(fmax((double)handler->tx_monitor_peak_abs / BLADERF_TX_FULL_SCALE, 1e-12));
+  const double rms_dbfs = 20.0 * log10(fmax(rms / BLADERF_TX_FULL_SCALE, 1e-12));
+  const double clipped_pct = 100.0 * handler->tx_monitor_clipped / handler->tx_monitor_component_count;
+
+  printf("bladeRF TX monitor: TX%u peak=%.2f dBFS rms=%.2f dBFS clipped=%" PRIu64 "/%" PRIu64
+         " (%.6f%%) underruns=%" PRIu64 "\n",
+         handler->tx_channel_number,
+         peak_dbfs,
+         rms_dbfs,
+         handler->tx_monitor_clipped,
+         handler->tx_monitor_component_count,
+         clipped_pct,
+         handler->tx_monitor_underruns);
+  fflush(stdout);
+
+  handler->tx_monitor_sample_count    = 0;
+  handler->tx_monitor_component_count = 0;
+  handler->tx_monitor_sum_squares     = 0;
+  handler->tx_monitor_clipped         = 0;
+  handler->tx_monitor_peak_abs        = 0;
+}
+
 int rf_blade_send_timed(void*       h,
                         void*       data,
                         int         nsamples,
@@ -829,6 +903,7 @@ int rf_blade_send_timed(void*       h,
     ERROR("TX failed: %s", bladerf_strerror(status));
     return status;
   } else if (meta.status == BLADERF_META_STATUS_UNDERRUN) {
+    handler->tx_monitor_underruns++;
     if (blade_error_handler) {
       error.type = SRSRAN_RF_ERROR_UNDERFLOW;
       blade_error_handler(blade_error_handler_arg, error);
@@ -836,6 +911,8 @@ int rf_blade_send_timed(void*       h,
       ERROR("TX warning: underflow detected.");
     }
   }
+
+  rf_blade_monitor_tx(handler, nsamples);
 
   return nsamples;
 }
