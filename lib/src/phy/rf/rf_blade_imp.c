@@ -22,6 +22,7 @@
 #include <libbladeRF.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -34,6 +35,8 @@
 
 #define UNUSED __attribute__((unused))
 #define CONVERT_BUFFER_SIZE (240 * 1024)
+#define BLADERF_RX_FULL_SCALE 2048.0
+#define BLADERF_RX_CLIP_LEVEL 2047
 
 typedef struct {
   struct bladerf*     dev;
@@ -47,6 +50,11 @@ typedef struct {
   bladerf_channel     tx_channel;
   uint32_t            rx_channel_number;
   uint32_t            tx_channel_number;
+  bool                rx_monitor_enabled;
+  uint64_t            rx_monitor_last_timestamp;
+  uint64_t            rx_monitor_overruns;
+  bladerf_gain        rx_gain_config;
+  bladerf_gain_mode   rx_gain_mode;
   srsran_rf_info_t    info;
 } rf_blade_handler_t;
 
@@ -106,6 +114,21 @@ static int parse_channel_number(const char* value, const char* option, uint32_t*
   return SRSRAN_SUCCESS;
 }
 
+static int parse_bool_option(const char* value, const char* option, bool* parsed_value)
+{
+  if (strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "on") == 0) {
+    *parsed_value = true;
+    return SRSRAN_SUCCESS;
+  }
+  if (strcmp(value, "0") == 0 || strcmp(value, "false") == 0 || strcmp(value, "off") == 0) {
+    *parsed_value = false;
+    return SRSRAN_SUCCESS;
+  }
+
+  ERROR("Invalid bladeRF %s=%s. Expected true/false, on/off or 1/0.", option, value);
+  return SRSRAN_ERROR;
+}
+
 static int append_device_identifier(char device_identifier[RF_PARAM_LEN], const char* value)
 {
   size_t current_len = strlen(device_identifier);
@@ -128,10 +151,12 @@ static int append_device_identifier(char device_identifier[RF_PARAM_LEN], const 
 static int parse_blade_args(const char* args,
                             uint32_t*   tx_channel_number,
                             uint32_t*   rx_channel_number,
+                            bool*       rx_monitor_enabled,
                             char        device_identifier[RF_PARAM_LEN])
 {
   *tx_channel_number   = 1;
   *rx_channel_number   = 1;
+  *rx_monitor_enabled  = false;
   device_identifier[0] = '\0';
 
   if (args == NULL || args[0] == '\0' || strcmp(args, "auto") == 0) {
@@ -159,6 +184,10 @@ static int parse_blade_args(const char* args,
     } else if (strncmp(option, "rx_channel=", strlen("rx_channel=")) == 0) {
       if (parse_channel_number(option + strlen("rx_channel="), "rx_channel", rx_channel_number) !=
           SRSRAN_SUCCESS) {
+        return SRSRAN_ERROR;
+      }
+    } else if (strncmp(option, "rx_monitor=", strlen("rx_monitor=")) == 0) {
+      if (parse_bool_option(option + strlen("rx_monitor="), "rx_monitor", rx_monitor_enabled) != SRSRAN_SUCCESS) {
         return SRSRAN_ERROR;
       }
     } else if (option[0] != '\0' && strcmp(option, "auto") != 0) {
@@ -290,9 +319,11 @@ int rf_blade_open(char* args, void** h)
   char                        device_identifier[RF_PARAM_LEN] = {0};
   uint32_t                    tx_channel_number               = 1;
   uint32_t                    rx_channel_number               = 1;
+  bool                        rx_monitor_enabled               = false;
   *h = NULL;
 
-  if (parse_blade_args(args, &tx_channel_number, &rx_channel_number, device_identifier) != SRSRAN_SUCCESS) {
+  if (parse_blade_args(
+          args, &tx_channel_number, &rx_channel_number, &rx_monitor_enabled, device_identifier) != SRSRAN_SUCCESS) {
     return SRSRAN_ERROR;
   }
 
@@ -308,8 +339,16 @@ int rf_blade_open(char* args, void** h)
   handler->rx_channel_number = rx_channel_number;
   handler->tx_channel        = BLADERF_CHANNEL_TX(tx_channel_number - 1);
   handler->rx_channel        = BLADERF_CHANNEL_RX(rx_channel_number - 1);
+  handler->rx_monitor_enabled        = rx_monitor_enabled;
+  handler->rx_monitor_last_timestamp = 0;
+  handler->rx_monitor_overruns       = 0;
+  handler->rx_gain_config            = 0;
+  handler->rx_gain_mode              = BLADERF_GAIN_MGC;
 
-  printf("Opening bladeRF with TX%u/RX%u...\n", handler->tx_channel_number, handler->rx_channel_number);
+  printf("Opening bladeRF with TX%u/RX%u (RX monitor %s)...\n",
+         handler->tx_channel_number,
+         handler->rx_channel_number,
+         handler->rx_monitor_enabled ? "enabled" : "disabled");
   const char* identifier = device_identifier[0] == '\0' ? NULL : device_identifier;
   int         status     = bladerf_open(&handler->dev, identifier);
   if (status) {
@@ -352,6 +391,7 @@ int rf_blade_open(char* args, void** h)
     ERROR("Failed to set RX LNA gain: %s", bladerf_strerror(status));
     goto clean_exit;
   }
+  handler->rx_gain_config = (bladerf_gain)range_rx->max;
   handler->rx_stream_enabled = false;
   handler->tx_stream_enabled = false;
 
@@ -440,6 +480,8 @@ int rf_blade_set_rx_gain(void* h, double gain)
       ERROR("Failed to enable RX AGC: %s", bladerf_strerror(status));
       return SRSRAN_ERROR;
     }
+    handler->rx_gain_config = -1;
+    handler->rx_gain_mode   = BLADERF_GAIN_DEFAULT;
     return SRSRAN_SUCCESS;
   }
 
@@ -454,6 +496,8 @@ int rf_blade_set_rx_gain(void* h, double gain)
     ERROR("Failed to set RX gain: %s", bladerf_strerror(status));
     return SRSRAN_ERROR;
   }
+  handler->rx_gain_config = (bladerf_gain)gain;
+  handler->rx_gain_mode   = BLADERF_GAIN_MGC;
   return SRSRAN_SUCCESS;
 }
 
@@ -573,6 +617,50 @@ void rf_blade_get_time(void* h, time_t* secs, double* frac_secs)
   timestamp_to_secs(handler->rx_rate, meta.timestamp, secs, frac_secs);
 }
 
+static void rf_blade_monitor_rx(rf_blade_handler_t* handler, const struct bladerf_metadata* meta, uint32_t nsamples)
+{
+  if (!handler->rx_monitor_enabled || handler->rx_rate == 0 || nsamples == 0) {
+    return;
+  }
+
+  if (handler->rx_monitor_last_timestamp != 0 &&
+      meta->timestamp - handler->rx_monitor_last_timestamp < handler->rx_rate) {
+    return;
+  }
+  handler->rx_monitor_last_timestamp = meta->timestamp;
+
+  const uint32_t component_count = 2 * nsamples;
+  uint32_t       peak_abs        = 0;
+  uint32_t       clipped         = 0;
+  uint64_t       sum_squares     = 0;
+
+  for (uint32_t i = 0; i != component_count; ++i) {
+    const int32_t sample     = handler->rx_buffer[i];
+    const uint32_t sample_abs = sample < 0 ? (uint32_t)(-sample) : (uint32_t)sample;
+    peak_abs                 = sample_abs > peak_abs ? sample_abs : peak_abs;
+    sum_squares += (uint64_t)((int64_t)sample * sample);
+    clipped += sample_abs >= BLADERF_RX_CLIP_LEVEL;
+  }
+
+  const double rms         = sqrt((double)sum_squares / component_count);
+  const double peak_dbfs   = 20.0 * log10(fmax((double)peak_abs / BLADERF_RX_FULL_SCALE, 1e-12));
+  const double rms_dbfs    = 20.0 * log10(fmax(rms / BLADERF_RX_FULL_SCALE, 1e-12));
+  const double clipped_pct = 100.0 * clipped / component_count;
+
+  printf("bladeRF RX monitor: RX%u gain_cfg=%d mode=%d peak=%.2f dBFS rms=%.2f dBFS "
+         "clipped=%u/%u (%.6f%%) overruns=%" PRIu64 "\n",
+         handler->rx_channel_number,
+         (int)handler->rx_gain_config,
+         (int)handler->rx_gain_mode,
+         peak_dbfs,
+         rms_dbfs,
+         clipped,
+         component_count,
+         clipped_pct,
+         handler->rx_monitor_overruns);
+  fflush(stdout);
+}
+
 int rf_blade_recv_with_time_multi(void*    h,
                                   void**   data,
                                   uint32_t nsamples,
@@ -606,6 +694,7 @@ int rf_blade_recv_with_time(void*       h,
     ERROR("RX failed: %s; nsamples=%d;", bladerf_strerror(status), nsamples);
     return -1;
   } else if (meta.status & BLADERF_META_STATUS_OVERRUN) {
+    handler->rx_monitor_overruns++;
     if (blade_error_handler) {
       srsran_rf_error_t error;
       error.opt  = meta.actual_count;
@@ -617,6 +706,7 @@ int rf_blade_recv_with_time(void*       h,
     }
   }
 
+  rf_blade_monitor_rx(handler, &meta, nsamples);
   timestamp_to_secs(handler->rx_rate, meta.timestamp, secs, frac_secs);
   srsran_vec_convert_if(handler->rx_buffer, 2048, data, 2 * nsamples);
 
