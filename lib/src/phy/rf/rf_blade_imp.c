@@ -416,6 +416,16 @@ int rf_blade_open(char* args, void** h)
     goto clean_exit;
   }
 
+  printf("bladeRF gain ranges: TX%u=%.1f..%.1f dB step %.1f; RX%u=%.1f..%.1f dB step %.1f\n",
+         handler->tx_channel_number,
+         (double)range_tx->min * range_tx->scale,
+         (double)range_tx->max * range_tx->scale,
+         (double)range_tx->step * range_tx->scale,
+         handler->rx_channel_number,
+         (double)range_rx->min * range_rx->scale,
+         (double)range_rx->max * range_rx->scale,
+         (double)range_rx->step * range_rx->scale);
+
   status = bladerf_set_gain(handler->dev, handler->rx_channel, (bladerf_gain)range_rx->max);
   if (status != 0) {
     ERROR("Failed to set RX LNA gain: %s", bladerf_strerror(status));
@@ -540,12 +550,19 @@ int rf_blade_set_rx_gain_ch(void* h, UNUSED uint32_t ch, double gain)
 int rf_blade_set_tx_gain(void* h, double gain)
 {
   int                 status;
+  bladerf_gain        actual_gain;
   rf_blade_handler_t* handler = (rf_blade_handler_t*)h;
   status                      = bladerf_set_gain(handler->dev, handler->tx_channel, (bladerf_gain)gain);
   if (status != 0) {
     ERROR("Failed to set TX gain: %s", bladerf_strerror(status));
     return SRSRAN_ERROR;
   }
+  status = bladerf_get_gain(handler->dev, handler->tx_channel, &actual_gain);
+  if (status != 0) {
+    ERROR("Failed to read back TX gain: %s", bladerf_strerror(status));
+    return SRSRAN_ERROR;
+  }
+  printf("Set TX%u gain: requested=%.1f dB actual=%d dB\n", handler->tx_channel_number, gain, actual_gain);
   return SRSRAN_SUCCESS;
 }
 
