@@ -52,6 +52,7 @@ typedef struct {
   bladerf_channel     tx_channel;
   uint32_t            rx_channel_number;
   uint32_t            tx_channel_number;
+  bladerf_sample_rate initial_sample_rate;
   bool                rx_monitor_enabled;
   uint64_t            rx_monitor_last_timestamp;
   uint64_t            rx_monitor_overruns;
@@ -138,6 +139,26 @@ static int parse_bool_option(const char* value, const char* option, bool* parsed
   return SRSRAN_ERROR;
 }
 
+static int parse_sample_rate(const char* value, bladerf_sample_rate* sample_rate)
+{
+  char*  end    = NULL;
+  double parsed = 0.0;
+
+  errno  = 0;
+  parsed = strtod(value, &end);
+  while (end != NULL && (*end == ' ' || *end == '\t')) {
+    end++;
+  }
+  if (errno != 0 || end == value || end == NULL || *end != '\0' || !isfinite(parsed) || parsed < 520000.0 ||
+      parsed > 61440000.0) {
+    ERROR("Invalid bladeRF initial_srate=%s. Expected 520000..61440000 samples/s.", value);
+    return SRSRAN_ERROR;
+  }
+
+  *sample_rate = (bladerf_sample_rate)llround(parsed);
+  return SRSRAN_SUCCESS;
+}
+
 static int append_device_identifier(char device_identifier[RF_PARAM_LEN], const char* value)
 {
   size_t current_len = strlen(device_identifier);
@@ -158,16 +179,18 @@ static int append_device_identifier(char device_identifier[RF_PARAM_LEN], const 
 }
 
 static int parse_blade_args(const char* args,
-                            uint32_t*   tx_channel_number,
-                            uint32_t*   rx_channel_number,
-                            bool*       rx_monitor_enabled,
-                            bool*       tx_monitor_enabled,
-                            char        device_identifier[RF_PARAM_LEN])
+                            uint32_t* tx_channel_number,
+                            uint32_t* rx_channel_number,
+                            bool* rx_monitor_enabled,
+                            bool* tx_monitor_enabled,
+                            bladerf_sample_rate* initial_sample_rate,
+                            char device_identifier[RF_PARAM_LEN])
 {
   *tx_channel_number   = 1;
   *rx_channel_number   = 1;
   *rx_monitor_enabled  = false;
   *tx_monitor_enabled  = false;
+  *initial_sample_rate = 1920000;
   device_identifier[0] = '\0';
 
   if (args == NULL || args[0] == '\0' || strcmp(args, "auto") == 0) {
@@ -203,6 +226,10 @@ static int parse_blade_args(const char* args,
       }
     } else if (strncmp(option, "tx_monitor=", strlen("tx_monitor=")) == 0) {
       if (parse_bool_option(option + strlen("tx_monitor="), "tx_monitor", tx_monitor_enabled) != SRSRAN_SUCCESS) {
+        return SRSRAN_ERROR;
+      }
+    } else if (strncmp(option, "initial_srate=", strlen("initial_srate=")) == 0) {
+      if (parse_sample_rate(option + strlen("initial_srate="), initial_sample_rate) != SRSRAN_SUCCESS) {
         return SRSRAN_ERROR;
       }
     } else if (option[0] != '\0' && strcmp(option, "auto") != 0) {
@@ -336,6 +363,7 @@ int rf_blade_open(char* args, void** h)
   uint32_t                    rx_channel_number               = 1;
   bool                        rx_monitor_enabled               = false;
   bool                        tx_monitor_enabled               = false;
+  bladerf_sample_rate         initial_sample_rate              = 1920000;
   *h = NULL;
 
   if (parse_blade_args(args,
@@ -343,6 +371,7 @@ int rf_blade_open(char* args, void** h)
                        &rx_channel_number,
                        &rx_monitor_enabled,
                        &tx_monitor_enabled,
+                       &initial_sample_rate,
                        device_identifier) != SRSRAN_SUCCESS) {
     return SRSRAN_ERROR;
   }
@@ -354,11 +383,12 @@ int rf_blade_open(char* args, void** h)
   }
   *h = handler;
 
-  handler->dev               = NULL;
-  handler->tx_channel_number = tx_channel_number;
-  handler->rx_channel_number = rx_channel_number;
-  handler->tx_channel        = BLADERF_CHANNEL_TX(tx_channel_number - 1);
-  handler->rx_channel        = BLADERF_CHANNEL_RX(rx_channel_number - 1);
+  handler->dev                 = NULL;
+  handler->tx_channel_number   = tx_channel_number;
+  handler->initial_sample_rate = initial_sample_rate;
+  handler->rx_channel_number   = rx_channel_number;
+  handler->tx_channel          = BLADERF_CHANNEL_TX(tx_channel_number - 1);
+  handler->rx_channel          = BLADERF_CHANNEL_RX(rx_channel_number - 1);
   handler->rx_monitor_enabled        = rx_monitor_enabled;
   handler->rx_monitor_last_timestamp = 0;
   handler->rx_monitor_overruns       = 0;
@@ -372,9 +402,10 @@ int rf_blade_open(char* args, void** h)
   handler->rx_gain_config            = 0;
   handler->rx_gain_mode              = BLADERF_GAIN_MGC;
 
-  printf("Opening bladeRF with TX%u/RX%u (RX monitor %s, TX monitor %s)...\n",
+  printf("Opening bladeRF with TX%u/RX%u (initial srate %.3f Msps, RX monitor %s, TX monitor %s)...\n",
          handler->tx_channel_number,
          handler->rx_channel_number,
+         (double)handler->initial_sample_rate / 1e6,
          handler->rx_monitor_enabled ? "enabled" : "disabled",
          handler->tx_monitor_enabled ? "enabled" : "disabled");
   const char* identifier = device_identifier[0] == '\0' ? NULL : device_identifier;
@@ -464,8 +495,8 @@ int rf_blade_open(char* args, void** h)
   handler->tx_stream_enabled = false;
 
   /* Set default sampling rates */
-  rf_blade_set_tx_srate(handler, 1.92e6);
-  rf_blade_set_rx_srate(handler, 1.92e6);
+  rf_blade_set_tx_srate(handler, handler->initial_sample_rate);
+  rf_blade_set_rx_srate(handler, handler->initial_sample_rate);
 
   /* Set info structure */
   handler->info.min_tx_gain = range_tx->min;
@@ -494,9 +525,9 @@ int rf_blade_close(void* h)
 double rf_blade_set_rx_srate(void* h, double freq)
 {
   uint32_t            bw;
+  bladerf_sample_rate requested_rate = (bladerf_sample_rate)llround(freq);
   rf_blade_handler_t* handler = (rf_blade_handler_t*)h;
-  int                 status  =
-      bladerf_set_sample_rate(handler->dev, handler->rx_channel, (uint32_t)freq, &handler->rx_rate);
+  int                 status  = bladerf_set_sample_rate(handler->dev, handler->rx_channel, requested_rate, &handler->rx_rate);
   if (status != 0) {
     ERROR("Failed to set samplerate = %u: %s", (uint32_t)freq, bladerf_strerror(status));
     return -1;
@@ -515,16 +546,21 @@ double rf_blade_set_rx_srate(void* h, double freq)
       return -1;
     }
   }
-  printf("Set RX sampling rate %.2f Mhz, filter BW: %.2f Mhz\n", (float)handler->rx_rate / 1e6, (float)bw / 1e6);
+  const double error_ppm = 1e6 * ((double)handler->rx_rate - requested_rate) / requested_rate;
+  printf("Set RX sampling rate: requested=%u actual=%u Hz error=%+.3f ppm, filter BW=%u Hz\n",
+         requested_rate,
+         handler->rx_rate,
+         error_ppm,
+         bw);
   return (double)handler->rx_rate;
 }
 
 double rf_blade_set_tx_srate(void* h, double freq)
 {
   uint32_t            bw;
+  bladerf_sample_rate requested_rate = (bladerf_sample_rate)llround(freq);
   rf_blade_handler_t* handler = (rf_blade_handler_t*)h;
-  int                 status  =
-      bladerf_set_sample_rate(handler->dev, handler->tx_channel, (uint32_t)freq, &handler->tx_rate);
+  int                 status  = bladerf_set_sample_rate(handler->dev, handler->tx_channel, requested_rate, &handler->tx_rate);
   if (status != 0) {
     ERROR("Failed to set samplerate = %u: %s", (uint32_t)freq, bladerf_strerror(status));
     return -1;
@@ -534,7 +570,12 @@ double rf_blade_set_tx_srate(void* h, double freq)
     ERROR("Failed to set bandwidth = %u: %s", handler->tx_rate, bladerf_strerror(status));
     return -1;
   }
-  printf("Set TX sampling rate %.2f Mhz, filter BW: %.2f Mhz\n", (float)handler->tx_rate / 1e6, (float)bw / 1e6);
+  const double error_ppm = 1e6 * ((double)handler->tx_rate - requested_rate) / requested_rate;
+  printf("Set TX sampling rate: requested=%u actual=%u Hz error=%+.3f ppm, filter BW=%u Hz\n",
+         requested_rate,
+         handler->tx_rate,
+         error_ppm,
+         bw);
   return (double)handler->tx_rate;
 }
 
