@@ -376,12 +376,21 @@ void s1ap::stop()
 
 void s1ap::get_metrics(s1ap_metrics_t& m)
 {
+  m.identities.clear();
   if (!running) {
     m.status = S1AP_ERROR;
     return;
   }
   if (mme_connected) {
     m.status = S1AP_READY;
+    // Called on the stack thread, alongside MAC/RRC metrics. Export live
+    // contexts rather than reconstructing identity from asynchronous logs.
+    for (const auto& entry : users) {
+      const auto& ctxt = entry.second->ctxt;
+      if (ctxt.mme_ue_s1ap_id.has_value()) {
+        m.identities.push_back({ctxt.rnti, args.enb_id, ctxt.enb_ue_s1ap_id, ctxt.mme_ue_s1ap_id.value()});
+      }
+    }
   } else {
     m.status = S1AP_ATTACHING;
   }

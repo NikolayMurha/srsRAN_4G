@@ -48,6 +48,9 @@ DECLARE_METRIC_SET("bearer_container",
 
 /// UE container metrics.
 DECLARE_METRIC("ue_rnti", metric_ue_rnti, uint32_t, "");
+DECLARE_METRIC("enb_id", metric_enb_id, uint32_t, "");
+DECLARE_METRIC("enb_ue_s1ap_id", metric_enb_ue_s1ap_id, uint32_t, "");
+DECLARE_METRIC("mme_ue_s1ap_id", metric_mme_ue_s1ap_id, uint32_t, "");
 DECLARE_METRIC("dl_cqi", metric_dl_cqi, float, "");
 DECLARE_METRIC("dl_mcs", metric_dl_mcs, float, "");
 DECLARE_METRIC("dl_bitrate", metric_dl_bitrate, float, "");
@@ -69,6 +72,9 @@ DECLARE_METRIC_LIST("bearer_list", mlist_bearers, std::vector<mset_bearer_contai
 DECLARE_METRIC_SET("ue_container",
                    mset_ue_container,
                    metric_ue_rnti,
+                   metric_enb_id,
+                   metric_enb_ue_s1ap_id,
+                   metric_mme_ue_s1ap_id,
                    metric_dl_cqi,
                    metric_dl_mcs,
                    metric_ul_pusch_rssi,
@@ -109,6 +115,14 @@ using metric_context_t = srslog::build_context_type<metric_type_tag, metric_time
 static void fill_ue_metrics(mset_ue_container& ue, const enb_metrics_t& m, unsigned i)
 {
   ue.write<metric_ue_rnti>(m.stack.mac.ues[i].rnti);
+  for (const auto& identity : m.stack.s1ap.identities) {
+    if (identity.rnti == m.stack.mac.ues[i].rnti) {
+      ue.write<metric_enb_id>(identity.enb_id);
+      ue.write<metric_enb_ue_s1ap_id>(identity.enb_ue_s1ap_id);
+      ue.write<metric_mme_ue_s1ap_id>(identity.mme_ue_s1ap_id);
+      break;
+    }
+  }
   ue.write<metric_dl_cqi>(std::max(0.1f, m.stack.mac.ues[i].dl_cqi));
   if (!std::isnan(m.phy[i].dl.mcs)) {
     ue.write<metric_dl_mcs>(m.phy[i].dl.mcs);
