@@ -22,6 +22,9 @@
 #ifndef SRSENB_S1AP_METRICS_H
 #define SRSENB_S1AP_METRICS_H
 
+#include <cstdint>
+#include <vector>
+
 namespace srsenb {
 
 typedef enum {
@@ -32,6 +35,13 @@ typedef enum {
 
 struct s1ap_metrics_t {
   S1AP_STATUS_ENUM status;
+  struct ue_identity {
+    uint32_t rnti;
+    uint32_t enb_id;
+    uint32_t enb_ue_s1ap_id;
+    uint32_t mme_ue_s1ap_id;
+  };
+  std::vector<ue_identity> identities;
 };
 
 } // namespace srsenb
